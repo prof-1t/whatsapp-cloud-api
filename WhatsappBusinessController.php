@@ -22,6 +22,18 @@ use Netflie\WhatsAppCloudApi\Message\Template\Component;
 use Netflie\WhatsAppCloudApi\Response\ResponseException;
 use Netflie\WhatsAppCloudApi\WhatsAppCloudApi;
 use Netflie\WhatsAppCloudApi\WebHook;
+use Netflie\WhatsAppCloudApi\WebHook\Notification\Button;
+use Netflie\WhatsAppCloudApi\WebHook\Notification\Contact as ContactNotification;
+use Netflie\WhatsAppCloudApi\WebHook\Notification\Flow;
+use Netflie\WhatsAppCloudApi\WebHook\Notification\Interactive;
+use Netflie\WhatsAppCloudApi\WebHook\Notification\Location as LocationNotification;
+use Netflie\WhatsAppCloudApi\WebHook\Notification\Media as MediaNotification;
+use Netflie\WhatsAppCloudApi\WebHook\Notification\MessageNotification;
+use Netflie\WhatsAppCloudApi\WebHook\Notification\Reaction as ReactionNotification;
+use Netflie\WhatsAppCloudApi\WebHook\Notification\StatusNotification;
+use Netflie\WhatsAppCloudApi\WebHook\Notification\System as SystemNotification;
+use Netflie\WhatsAppCloudApi\WebHook\Notification\Text as TextNotification;
+use Netflie\WhatsAppCloudApi\WebHook\Notification\Unknown as UnknownNotification;
 use App\Responses\SendMediaToApiResponse;
 use App\Responses\SendMessageToApiResponse;
 use App\Responses\UpdateReadHistoryResponse;
@@ -62,60 +74,46 @@ class WhatsappBusinessController extends AbstractMessengerController
     public function handle(Request $request)
     {
         $payload = $request->input();
-        $configuredPhoneId = config('services.whatsapp_business.id');
+        $configuredPhoneId = (string) config('services.whatsapp_business.id');
 
         app()->singleton('customDataForBlade', fn() => $payload);
 
-        // Пробегаем по всем entry/changes, чтобы не пропустить батч-вебхуки
-        foreach ($payload['entry'] ?? [] as $entry) {
-            foreach ($entry['changes'] ?? [] as $change) {
-                Log::channel('whatsapp_business_webhook')->info('Webhook received:', $change);
+        $webhook = new WebHook();
+        $notifications = $webhook->readAll($payload);
 
-                $value = $change['value'] ?? null;
-                if (!$value || !isset($value['metadata']['phone_number_id'])) {
-                    continue; // пропускаем некорректные события
-                }
+        foreach ($notifications as $notification) {
+            if (!$notification instanceof \Netflie\WhatsAppCloudApi\WebHook\Notification) {
+                continue;
+            }
 
-                $phoneId = $value['metadata']['phone_number_id'];
+            if ((string) $notification->businessPhoneNumberId() !== $configuredPhoneId) {
+                Log::channel('whatsapp_business_webhook')->warning(
+                    'Ignored webhook from another phone_number_id',
+                    [
+                        'received' => $notification->businessPhoneNumberId(),
+                        'expected' => $configuredPhoneId,
+                        'notification' => get_class($notification),
+                    ]
+                );
 
-                // Проверяем, что это наш номер
-                if ((string) $phoneId !== (string) $configuredPhoneId) {
-                    Log::channel('whatsapp_business_webhook')->warning(
-                        'Ignored webhook from another phone_number_id',
-                        ['received' => $phoneId, 'expected' => $configuredPhoneId]
-                    );
-                    continue; // игнорируем чужие номера
-                }
+                continue;
+            }
 
-                // Определяем тип события
-                $eventType = null;
+            if ($notification instanceof StatusNotification) {
+                $result = $this->messageStatus($notification);
+            } elseif ($notification instanceof ReactionNotification) {
+                $result = $this->messageReaction($notification);
+            } elseif ($notification instanceof MessageNotification) {
+                $result = $this->messageReceived($notification);
+            } else {
+                Log::channel('whatsapp_business_webhook')->info('Undefined notification type', [
+                    'notification' => get_class($notification),
+                ]);
+                continue;
+            }
 
-                if (!empty($value['messages'])) {
-                    $type = $value['messages'][0]['type'] ?? null;
-
-                    if (in_array($type, ['text', 'image', 'document', 'video', 'audio', 'location', 'contacts', 'button'])) {
-                        $eventType = 'messageReceived';
-                    } elseif ($type === 'reaction') {
-                        $eventType = 'messageReaction';
-                    }
-                } elseif (!empty($value['statuses'])) {
-                    $eventType = 'messageStatus';
-                }
-
-                // Вызываем обработчик, если он есть
-                if ($eventType && method_exists($this, $eventType)) {
-                    $result = $this->$eventType($change);
-
-                    if ($result && ($result['success'] ?? false)) {
-                        broadcast(new MessageEvent($result))->toOthers();
-                    }
-                } else {
-                    // Логируем необработанные типы
-                    $msgType = $value['messages'][0]['type'] ?? null;
-                    $suffix = $msgType ? (': ' . $msgType) : '';
-                    report(new \Exception('Undefined event type' . ($eventType ? $suffix : '')));
-                    Log::channel('whatsapp_business_webhook')->info('Undefined event type', $change);
-                }
+            if ($result && ($result['success'] ?? false)) {
+                broadcast(new MessageEvent($result))->toOthers();
             }
         }
 
@@ -125,88 +123,83 @@ class WhatsappBusinessController extends AbstractMessengerController
     /**
      * @throws ResponseException
      */
-    public function messageReceived($change)
+    public function messageReceived(MessageNotification $notification)
     {
-        $value = $change['value'];
-        $messageData = $value['messages'][0];
+        $messengerId = $notification->id();
+        $customer = $notification->customer();
+        $phone = $customer?->phoneNumber();
 
-        $messengerId = $messageData['id'];
-        $phone = $messageData['from'];
+        $content = '';
+        $media = null;
 
-        if ($messageData['type'] === 'text') {
-            $content = $messageData['text']['body'];
-        } elseif ($messageData['type'] === 'image') {
-            $content = $messageData['image']['caption'] ?? '';
-            $mediaId = $messageData['image']['id'];
-            $mimeType = $messageData['image']['mime_type'];
-            $fileName = $mediaId . '.' . explode('/', $mimeType)[1];
-
-            $media = $this->createFileByMediaId($mediaId, $fileName, $messageData['type']);
-        } elseif ($messageData['type'] === 'document') {
-            $content = '';
-            $mediaId = $messageData['document']['id'];
-            $fileName = $messageData['document']['filename'];
-
-            $media = $this->createFileByMediaId($mediaId, $fileName, $messageData['type']);
-        } elseif ($messageData['type'] === 'video') {
-            $content = $messageData['video']['caption'] ?? '';
-            $mediaId = $messageData['video']['id'];
-            $mimeType = $messageData['video']['mime_type'];
-            $fileName = $mediaId . '.' . explode('/', $mimeType)[1];
-
-            $media = $this->createFileByMediaId($mediaId, $fileName, $messageData['type']);
-        } elseif ($messageData['type'] === 'audio') {
-            $content = '';
-            $mediaId = $messageData['audio']['id'];
-            $mimeType = strtok($messageData['audio']['mime_type'], ';');
-            $fileName = $mediaId . '.' . explode('/', $mimeType)[1];
-
-            $media = $this->createFileByMediaId($mediaId, $fileName, $messageData['type']);
-        } elseif ($messageData['type'] === 'location') {
-            $lat = $messageData['location']['latitude'];
-            $long = $messageData['location']['longitude'];
-            $content = "https://www.google.com/maps?q=$lat,$long";
-        } elseif ($messageData['type'] == 'contacts') {
-            $content = $messageData['contacts'][0]['name']['formatted_name'] . ' (' . $messageData['contacts'][0]['phones'][0]['phone'] . ')';
-        } elseif ($messageData['type'] == 'button') {
-            $content = $messageData['button']['text'];
+        switch (true) {
+            case $notification instanceof TextNotification:
+                $content = $notification->message();
+                break;
+            case $notification instanceof MediaNotification:
+                $content = $notification->caption();
+                $mimeTypeRaw = $notification->mimeType();
+                $mimeType = $mimeTypeRaw !== '' ? explode(';', $mimeTypeRaw)[0] : null;
+                $fileName = $notification->filename() ?: $this->buildFilenameFromMimeType($notification->imageId(), $mimeType);
+                $media = $this->createFileByMediaId(
+                    $notification->imageId(),
+                    $fileName,
+                    $this->guessMediaType($mimeType)
+                );
+                break;
+            case $notification instanceof LocationNotification:
+                $lat = $notification->latitude();
+                $long = $notification->longitude();
+                $content = "https://www.google.com/maps?q=$lat,$long";
+                break;
+            case $notification instanceof ContactNotification:
+                $phones = $notification->phones();
+                $firstPhone = $phones[0]['phone'] ?? '';
+                $content = trim($notification->formattedName() . ($firstPhone ? ' (' . $firstPhone . ')' : ''));
+                break;
+            case $notification instanceof Button:
+                $content = $notification->text();
+                break;
+            case $notification instanceof Interactive:
+                $content = $notification->title();
+                break;
+            case $notification instanceof Flow:
+                $content = $notification->body();
+                break;
+            case $notification instanceof SystemNotification:
+                $content = $notification->message();
+                break;
+            case $notification instanceof UnknownNotification:
+            default:
+                $content = '';
         }
 
-        $timestamp = $messageData['timestamp'];
-        $replyMessageId = $messageData['context']['id'] ?? null;
+        $timestamp = $notification->receivedAt()->getTimestamp();
+        $replyMessageId = $notification->replyingToMessageId();
 
         return $this->updateMessageReceived(
-            intval($phone),
+            intval($phone ?? 0),
             strval($messengerId),
             strval($content ?? ''),
             intval($timestamp),
             null,
             $replyMessageId ?? null,
-            false,
+            $notification->isForwarded(),
             $media ?? null,
-            [
-                'room_name' => $value['contacts'][0]['profile']['name'] ?? $value['contacts'][0]['wa_id'],
-                'avatar' => 'empty-avatar.png',
-                'username' => $value['contacts'][0]['profile']['name'] ?? null,
-                'phone' => $value['contacts'][0]['wa_id'] ?? null,
-                'status_state' => 'offline',
-                'status_lastChanged' => 0
-            ]
+            $this->buildRoomOptions($customer)
         );
     }
 
 
-    public function messageStatus($change)
+    public function messageStatus(StatusNotification $notification)
     {
-        $statusData = $change['value']['statuses'][0];
-
-        $messengerId = $statusData['id'];
+        $messengerId = $notification->id();
         $message = $this->message->where('messenger_id', $messengerId)->first(); //todo add filter by channel
 
         if ($message) {
             $room = $this->roomOfChannel->where('chat_id', $message->chat_id)->first();
 
-            return match ($statusData['status']) {
+            return match ($notification->status()) {
                 'sent' => $this->updateMessageStatusSaved($room->chat_id, $messengerId),
                 'delivered' => $this->updateMessageStatusDistributed($room->chat_id, $messengerId),
                 'read' => $this->updateMessageStatusSeen($room->chat_id, $message->from_me, $messengerId),
@@ -217,13 +210,9 @@ class WhatsappBusinessController extends AbstractMessengerController
         }
     }
 
-    public function messageReaction($change)
+    public function messageReaction(ReactionNotification $notification)
     {
-        $value = $change['value'];
-
-        $messageData = $value['messages'][0];
-
-        $messengerId = $messageData['reaction']['message_id'];
+        $messengerId = $notification->messageId();
 
         $currentMessage = $this->message->where('messenger_id', $messengerId)->first();
 
@@ -233,11 +222,48 @@ class WhatsappBusinessController extends AbstractMessengerController
 
         $currentMessageData = $currentMessage->toArray();
 
-        $emoji = data_get($value, 'messages.0.reaction.emoji') ?? null;
+        $emoji = $notification->emoji() ?: null;
 
         $currentMessageData['reactions'] = $this->mergeReactions($currentMessageData['reactions'], $emoji, $currentMessage->chat_id, !$emoji);
 
         return $this->updateMessageEdited($currentMessage->chat_id, $currentMessage, $currentMessageData);
+    }
+
+    private function buildFilenameFromMimeType(string $mediaId, ?string $mimeType): string
+    {
+        $normalizedMime = $mimeType ?: 'application/octet-stream';
+        $parts = explode('/', $normalizedMime);
+        $extension = $parts[1] ?? 'bin';
+
+        return $mediaId . '.' . $extension;
+    }
+
+    private function guessMediaType(?string $mimeType): string
+    {
+        $normalizedMime = strtolower((string) $mimeType);
+
+        return match (true) {
+            Str::startsWith($normalizedMime, 'image/') => 'image',
+            Str::startsWith($normalizedMime, 'video/') => 'video',
+            Str::startsWith($normalizedMime, 'audio/') => 'audio',
+            Str::startsWith($normalizedMime, 'application/') => 'document',
+            default => 'document',
+        };
+    }
+
+    private function buildRoomOptions(?\Netflie\WhatsAppCloudApi\WebHook\Notification\Support\Customer $customer): array
+    {
+        $name = $customer?->name();
+        $waId = $customer?->id();
+
+        return [
+            'room_name' => $name ?? $waId ?? 'WhatsApp contact',
+            'avatar' => 'empty-avatar.png',
+            'username' => $name,
+            'phone' => $waId,
+            'status_state' => 'offline',
+            'status_lastChanged' => 0,
+        ];
     }
 
 
